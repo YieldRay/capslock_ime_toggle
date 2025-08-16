@@ -1,7 +1,3 @@
-
-// =====================
-// 头文件与宏定义
-// =====================
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0600
 #endif
@@ -21,9 +17,10 @@
 #define _tWinMain WinMain
 #endif
 
-volatile BOOL g_allowNextCaps = 0; // 标志：是否允许下一个CapsLock事件通过钩子
-HHOOK g_hHook = NULL;
-NOTIFYICONDATAW nid;
+volatile BOOL g_allowNextCaps = 0;  // 标志：是否允许下一个CapsLock事件通过钩子（用于托盘菜单手动切换大小写）
+HHOOK g_hHook = NULL;               // 全局低级键盘钩子句柄，用于拦截CapsLock按键
+NOTIFYICONDATAW nid;                // 系统托盘图标数据结构
+HANDLE g_hMutex = NULL;             // 全局互斥体句柄，防止程序多开
 
 // 判断当前进程是否为管理员
 BOOL IsRunAsAdmin()
@@ -52,10 +49,10 @@ void AddTrayIcon(HWND hwnd)
     nid.uID = 1;
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(101)); // 101为icon.rc中IDI_TRAYICON的资源ID
+    nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(101)); // 101是IDI_TRAYICON的资源ID值，定义在icon.rc中
     if (IsRunAsAdmin())
     {
-        lstrcpyW(nid.szTip, L"CapsLock IME Toggle (管理员)g");
+        lstrcpyW(nid.szTip, L"CapsLock IME Toggle (管理员)");
     }
     else
     {
@@ -168,7 +165,6 @@ void ShowTrayMenu(HWND hwnd)
         WCHAR exePath[MAX_PATH];
         if (GetModuleFileNameW(NULL, exePath, MAX_PATH))
         {
-            extern HANDLE g_hMutex;
             if (g_hMutex)
             {
                 CloseHandle(g_hMutex); // 先释放互斥体
@@ -301,7 +297,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 // 程序主入口，初始化互斥体、窗口、钩子和消息循环
-HANDLE g_hMutex = NULL;
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow)
 {
     SetProcessDPIAware();
@@ -348,10 +343,11 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     AddTrayIcon(hwnd);
 
     // 设置全局低级键盘钩子
-    g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
+    g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
     if (!g_hHook)
     {
         MessageBoxW(hwnd, L"无法安装键盘钩子", L"错误", MB_ICONERROR);
+        RemoveTrayIcon();
         DestroyWindow(hwnd);
         if (g_hMutex)
             CloseHandle(g_hMutex);
