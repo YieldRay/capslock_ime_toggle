@@ -1,14 +1,19 @@
-// 资源头文件声明
+
+// =====================
+// 头文件与宏定义
+// =====================
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #include <windows.h>
-volatile BOOL g_allowNextCaps = 0;                   // 标志：是否允许下一个CapsLock事件通过钩子
-#define MUTEX_NAME L"Global\\CapsLockImeToggleMutex" // 全局互斥体名，防止多开
-#include <windows.h>
+#include <shellscalingapi.h> // for SetProcessDPIAware
 #include <shellapi.h>
 #include <imm.h>
+#pragma comment(lib, "user32.lib")
 #pragma comment(lib, "imm32.lib")
 
-// 防止多开：全局互斥体名
-#define MUTEX_NAME L"Global\\CapsLockImeToggleMutex"
+#define MUTEX_NAME L"Global\\CapsLockImeToggleMutex" // 全局互斥体名，防止多开
+#define WM_TRAYICON (WM_USER + 1)                    // 托盘消息ID
 
 #ifdef UNICODE
 #define _tWinMain wWinMain
@@ -16,10 +21,8 @@ volatile BOOL g_allowNextCaps = 0;                   // 标志：是否允许下
 #define _tWinMain WinMain
 #endif
 
+volatile BOOL g_allowNextCaps = 0; // 标志：是否允许下一个CapsLock事件通过钩子
 HHOOK g_hHook = NULL;
-
-#define WM_TRAYICON (WM_USER + 1) // 托盘消息ID
-
 NOTIFYICONDATAW nid;
 
 // 判断当前进程是否为管理员
@@ -27,10 +30,12 @@ BOOL IsRunAsAdmin()
 {
     BOOL isAdmin = FALSE;
     HANDLE hToken = NULL;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+    {
         TOKEN_ELEVATION elevation;
         DWORD dwSize = sizeof(TOKEN_ELEVATION);
-        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &dwSize)) {
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &dwSize))
+        {
             isAdmin = elevation.TokenIsElevated;
         }
         CloseHandle(hToken);
@@ -48,9 +53,12 @@ void AddTrayIcon(HWND hwnd)
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(101)); // 101为icon.rc中IDI_TRAYICON的资源ID
-    if (IsRunAsAdmin()) {
+    if (IsRunAsAdmin())
+    {
         lstrcpyW(nid.szTip, L"CapsLock IME Toggle (管理员)g");
-    } else {
+    }
+    else
+    {
         lstrcpyW(nid.szTip, L"CapsLock IME Toggle");
     }
     if (!Shell_NotifyIconW(NIM_ADD, &nid))
@@ -152,7 +160,8 @@ void ShowTrayMenu(HWND hwnd)
     }
     case 400: // 以管理员模式重启当前进程
     {
-        if (IsRunAsAdmin()) {
+        if (IsRunAsAdmin())
+        {
             MessageBoxW(hwnd, L"当前已是管理员，无需重启！", L"提示", MB_OK | MB_ICONINFORMATION);
             break;
         }
@@ -295,6 +304,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 HANDLE g_hMutex = NULL;
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow)
 {
+    SetProcessDPIAware();
     // 创建互斥体，防止多开
     g_hMutex = CreateMutexW(NULL, FALSE, MUTEX_NAME);
     if (g_hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS)

@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -22,3 +25,14 @@ jobs:
         with:
           name: capslock_ime_toggle
           path: capslock_ime_toggle.exe
+
+      - name: Create or Update Release v0.0.0
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.0.0
+          name: v0.0.0
+          files: capslock_ime_toggle.exe
+          prerelease: false
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
