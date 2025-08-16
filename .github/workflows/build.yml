@@ -20,5 +20,5 @@ jobs:
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: capslock_ime_toggle_exe
+          name: capslock_ime_toggle
           path: capslock_ime_toggle.exe
