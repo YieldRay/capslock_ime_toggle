@@ -22,6 +22,22 @@ HHOOK g_hHook = NULL;
 
 NOTIFYICONDATAW nid;
 
+// 判断当前进程是否为管理员
+BOOL IsRunAsAdmin()
+{
+    BOOL isAdmin = FALSE;
+    HANDLE hToken = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        TOKEN_ELEVATION elevation;
+        DWORD dwSize = sizeof(TOKEN_ELEVATION);
+        if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &dwSize)) {
+            isAdmin = elevation.TokenIsElevated;
+        }
+        CloseHandle(hToken);
+    }
+    return isAdmin;
+}
+
 // 添加系统托盘图标
 void AddTrayIcon(HWND hwnd)
 {
@@ -32,7 +48,11 @@ void AddTrayIcon(HWND hwnd)
     nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
     nid.hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(101)); // 101为icon.rc中IDI_TRAYICON的资源ID
-    lstrcpyW(nid.szTip, L"CapsLock IME Toggle");
+    if (IsRunAsAdmin()) {
+        lstrcpyW(nid.szTip, L"CapsLock IME Toggle (管理员)g");
+    } else {
+        lstrcpyW(nid.szTip, L"CapsLock IME Toggle");
+    }
     if (!Shell_NotifyIconW(NIM_ADD, &nid))
     {
         MessageBoxW(hwnd, L"添加托盘图标失败！", L"错误", MB_OK | MB_ICONERROR);
@@ -132,6 +152,10 @@ void ShowTrayMenu(HWND hwnd)
     }
     case 400: // 以管理员模式重启当前进程
     {
+        if (IsRunAsAdmin()) {
+            MessageBoxW(hwnd, L"当前已是管理员，无需重启！", L"提示", MB_OK | MB_ICONINFORMATION);
+            break;
+        }
         WCHAR exePath[MAX_PATH];
         if (GetModuleFileNameW(NULL, exePath, MAX_PATH))
         {
