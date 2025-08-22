@@ -13,7 +13,7 @@ CapsLock IME Toggle 是一款 Windows 下的实用工具，能够拦截键盘上
 
 ## 使用方法
 
-1. 运行 `capslock_ime_toggle.exe`，程序会在系统托盘区显示图标。
+1. 运行 `capslock_ime_toggle.exe`，程序仅在**系统托盘区**显示图标。
 2. 正常输入时，直接按 CapsLock 键即可切换当前窗口输入法的中英文状态，系统大小写状态不会改变。
 3. 右键点击托盘图标，可弹出菜单：
    - **切换大小写**：允许本次 CapsLock 事件通过，手动切换系统大小写状态。
