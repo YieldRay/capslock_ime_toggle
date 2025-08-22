@@ -17,10 +17,10 @@
 #define _tWinMain WinMain
 #endif
 
-volatile BOOL g_allowNextCaps = 0;  // 标志：是否允许下一个CapsLock事件通过钩子（用于托盘菜单手动切换大小写）
-HHOOK g_hHook = NULL;               // 全局低级键盘钩子句柄，用于拦截CapsLock按键
-NOTIFYICONDATAW nid;                // 系统托盘图标数据结构
-HANDLE g_hMutex = NULL;             // 全局互斥体句柄，防止程序多开
+volatile BOOL g_allowNextCaps = 0; // 标志：是否允许下一个CapsLock事件通过钩子（用于托盘菜单手动切换大小写）
+HHOOK g_hHook = NULL;              // 全局低级键盘钩子句柄，用于拦截CapsLock按键
+NOTIFYICONDATAW nid;               // 系统托盘图标数据结构
+HANDLE g_hMutex = NULL;            // 全局互斥体句柄，防止程序多开
 
 // 判断当前进程是否为管理员
 BOOL IsRunAsAdmin()
@@ -159,8 +159,29 @@ void ShowTrayMenu(HWND hwnd)
     {
         if (IsRunAsAdmin())
         {
-            MessageBoxW(hwnd, L"当前已是管理员，无需重启！", L"提示", MB_OK | MB_ICONINFORMATION);
-            break;
+            {
+                int ret = MessageBoxW(hwnd, L"当前已是管理员，无需重启！\n是否强制以管理员模式重启？", L"提示", MB_OKCANCEL | MB_ICONQUESTION);
+                if (ret == IDOK)
+                {
+                    WCHAR exePath[MAX_PATH];
+                    if (GetModuleFileNameW(NULL, exePath, MAX_PATH))
+                    {
+                        if (g_hMutex)
+                        {
+                            CloseHandle(g_hMutex); // 先释放互斥体
+                            g_hMutex = NULL;
+                        }
+                        ShellExecuteW(NULL, L"runas", exePath, NULL, NULL, SW_SHOWNORMAL);
+                        PostMessage(hwnd, WM_CLOSE, 0, 0); // 关闭当前进程
+                    }
+                    else
+                    {
+                        MessageBoxW(hwnd, L"获取程序路径失败，无法重启！", L"错误", MB_OK | MB_ICONERROR);
+                    }
+                }
+                // 取消则什么都不做
+                break;
+            }
         }
         WCHAR exePath[MAX_PATH];
         if (GetModuleFileNameW(NULL, exePath, MAX_PATH))
