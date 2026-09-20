@@ -2,7 +2,8 @@
 #define _WIN32_WINNT 0x0600
 #endif
 #include <windows.h>
-#include <shellscalingapi.h> // for SetProcessDPIAware
+#include <stdio.h>
+#include <shellscalingapi.h> // 用于 SetProcessDPIAware
 #include <shellapi.h>
 #include <imm.h>
 #pragma comment(lib, "user32.lib")
@@ -10,6 +11,9 @@
 
 #define MUTEX_NAME L"Global\\CapsLockImeToggleMutex" // 全局互斥体名，防止多开
 #define WM_TRAYICON (WM_USER + 1)                    // 托盘消息ID
+#define WM_TOGGLE_IME (WM_USER + 2)                  // 异步切换输入法消息
+#define TASK_NAME L"CapsLockImeToggle"              // 计划任务名称
+#define SCHTASKS_EXECUTION_FAILED ((DWORD)-1)
 
 #ifdef UNICODE
 #define _tWinMain wWinMain
@@ -18,9 +22,18 @@
 #endif
 
 volatile BOOL g_allowNextCaps = 0; // 标志：是否允许下一个CapsLock事件通过钩子（用于托盘菜单手动切换大小写）
+volatile BOOL g_capsLockDown = FALSE; // 标志：CapsLock按键是否已经处理，防止长按重复切换
 HHOOK g_hHook = NULL;              // 全局低级键盘钩子句柄，用于拦截CapsLock按键
 NOTIFYICONDATAW nid;               // 系统托盘图标数据结构
 HANDLE g_hMutex = NULL;            // 全局互斥体句柄，防止程序多开
+HWND g_hMainWnd = NULL;             // 隐藏窗口句柄，用于异步切换输入法
+
+typedef enum
+{
+    AUTO_START_DISABLED,
+    AUTO_START_ENABLED,
+    AUTO_START_UNKNOWN
+} AutoStartState;
 
 // 判断当前进程是否为管理员
 BOOL IsRunAsAdmin()
@@ -38,6 +51,160 @@ BOOL IsRunAsAdmin()
         CloseHandle(hToken);
     }
     return isAdmin;
+}
+
+// 静默执行 schtasks.exe，返回进程退出码
+DWORD RunSchtasks(LPCWSTR args)
+{
+    WCHAR schtasksPath[MAX_PATH];
+    WCHAR cmdLine[2048];
+    UINT systemDirectoryLength = GetSystemDirectoryW(schtasksPath, MAX_PATH);
+    if (!systemDirectoryLength || systemDirectoryLength + lstrlenW(L"\\schtasks.exe") >= MAX_PATH)
+    {
+        return SCHTASKS_EXECUTION_FAILED;
+    }
+    lstrcatW(schtasksPath, L"\\schtasks.exe");
+    swprintf(cmdLine, sizeof(cmdLine) / sizeof(WCHAR), L"\"%s\" %s", schtasksPath, args);
+
+    STARTUPINFOW si = {0};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {0};
+    DWORD exitCode = SCHTASKS_EXECUTION_FAILED;
+    if (CreateProcessW(schtasksPath, cmdLine, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    {
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 10000);
+        if (waitResult == WAIT_OBJECT_0)
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+        else if (waitResult == WAIT_TIMEOUT)
+            TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    return exitCode;
+}
+
+// 通过 runas 提权执行 schtasks，仅在创建或删除任务时需要授权
+DWORD RunSchtasksElevated(LPCWSTR args)
+{
+    WCHAR schtasksPath[MAX_PATH];
+    UINT systemDirectoryLength = GetSystemDirectoryW(schtasksPath, MAX_PATH);
+    if (!systemDirectoryLength || systemDirectoryLength + lstrlenW(L"\\schtasks.exe") >= MAX_PATH)
+    {
+        return SCHTASKS_EXECUTION_FAILED;
+    }
+    lstrcatW(schtasksPath, L"\\schtasks.exe");
+
+    SHELLEXECUTEINFOW sei = {0};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = L"runas";
+    sei.lpFile = schtasksPath;
+    sei.lpParameters = args;
+    sei.nShow = SW_HIDE;
+    DWORD exitCode = SCHTASKS_EXECUTION_FAILED;
+    if (ShellExecuteExW(&sei) && sei.hProcess)
+    {
+        DWORD waitResult = WaitForSingleObject(sei.hProcess, 30000);
+        if (waitResult == WAIT_OBJECT_0)
+            GetExitCodeProcess(sei.hProcess, &exitCode);
+        else if (waitResult == WAIT_TIMEOUT)
+            TerminateProcess(sei.hProcess, ERROR_TIMEOUT);
+        CloseHandle(sei.hProcess);
+    }
+    return exitCode;
+}
+
+DWORD RunSchtasksAuto(LPCWSTR args)
+{
+    if (IsRunAsAdmin())
+        return RunSchtasks(args);
+    return RunSchtasksElevated(args);
+}
+
+AutoStartState GetAutoStartState()
+{
+    DWORD result = RunSchtasks(L"/query /tn \"" TASK_NAME L"\"");
+    if (result == 0)
+        return AUTO_START_ENABLED;
+    if (result == SCHTASKS_EXECUTION_FAILED)
+        return AUTO_START_UNKNOWN;
+    return AUTO_START_DISABLED;
+}
+
+DWORD EnableAutoStart()
+{
+    WCHAR exePath[MAX_PATH];
+    DWORD exePathLength = GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    if (!exePathLength || exePathLength >= MAX_PATH)
+        return SCHTASKS_EXECUTION_FAILED;
+
+    WCHAR args[MAX_PATH * 2 + 128];
+    swprintf(args, sizeof(args) / sizeof(WCHAR),
+             L"/create /tn \"%s\" /tr \"\\\"%s\\\"\" /sc onlogon /it /rl highest /f",
+             TASK_NAME, exePath);
+    return RunSchtasksAuto(args);
+}
+
+DWORD DisableAutoStart()
+{
+    return RunSchtasksAuto(L"/delete /tn \"" TASK_NAME L"\" /f");
+}
+
+void ShowAutoStartFailureMessage(HWND hwnd, AutoStartState state, DWORD result)
+{
+    WCHAR message[256];
+    if (result == SCHTASKS_EXECUTION_FAILED)
+    {
+        lstrcpyW(message, L"无法启动任务计划程序或用户取消了UAC授权。\n请重试并确认允许管理员授权。");
+    }
+    else
+    {
+        swprintf(message, sizeof(message) / sizeof(WCHAR), L"任务计划程序操作失败（返回码：%lu）。", result);
+    }
+
+    if (state == AUTO_START_ENABLED)
+    {
+        swprintf(message + lstrlenW(message), sizeof(message) / sizeof(WCHAR) - lstrlenW(message), L"\n当前仍已设置开机自启。");
+    }
+    else if (state == AUTO_START_DISABLED)
+    {
+        swprintf(message + lstrlenW(message), sizeof(message) / sizeof(WCHAR) - lstrlenW(message), L"\n当前仍未设置开机自启。");
+    }
+    else
+    {
+        swprintf(message + lstrlenW(message), sizeof(message) / sizeof(WCHAR) - lstrlenW(message), L"\n无法确认当前开机自启状态。");
+    }
+    MessageBoxW(hwnd, message, L"错误", MB_OK | MB_ICONERROR);
+}
+
+void ToggleAutoStart(HWND hwnd)
+{
+    AutoStartState initialState = GetAutoStartState();
+    if (initialState == AUTO_START_UNKNOWN)
+    {
+        MessageBoxW(hwnd, L"无法查询当前开机自启状态，操作未执行。", L"错误", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    BOOL enable = initialState == AUTO_START_DISABLED;
+    DWORD operationResult = enable ? EnableAutoStart() : DisableAutoStart();
+    if (operationResult == 0)
+    {
+        if (enable)
+        {
+            MessageBoxW(hwnd, L"已设置开机自启！\n登录时将自动以管理员权限运行，不会再弹出UAC窗口。", L"提示", MB_OK | MB_ICONINFORMATION);
+        }
+        else
+        {
+            MessageBoxW(hwnd, L"已取消开机自启！", L"提示", MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
+
+    AutoStartState finalState = GetAutoStartState();
+    ShowAutoStartFailureMessage(hwnd, finalState, operationResult);
 }
 
 // 添加系统托盘图标
@@ -76,14 +243,16 @@ void ShowTrayMenu(HWND hwnd)
     POINT pt;
     GetCursorPos(&pt);
     HMENU hMenu = CreatePopupMenu();
+    AutoStartState autoStartState = GetAutoStartState();
     AppendMenuW(hMenu, MF_STRING, 100, L"切换大小写");
-    AppendMenuW(hMenu, MF_STRING, 200, L"切换开机自启");
+    AppendMenuW(hMenu, MF_STRING | (autoStartState == AUTO_START_ENABLED ? MF_CHECKED : 0), 200, L"切换开机自启（管理员）");
     AppendMenuW(hMenu, MF_STRING, 300, L"输入法设置");
     AppendMenuW(hMenu, MF_STRING, 400, L"以管理员模式重启");
     AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(hMenu, MF_STRING, 1, L"退出");
     SetForegroundWindow(hwnd);
     int cmd = TrackPopupMenu(hMenu, TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_LEFTALIGN, pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
     switch (cmd)
     {
     case 1: // 退出程序
@@ -94,58 +263,9 @@ void ShowTrayMenu(HWND hwnd)
         keybd_event(VK_CAPITAL, 0, 0, 0);
         keybd_event(VK_CAPITAL, 0, KEYEVENTF_KEYUP, 0);
         break;
-    case 200: // 切换开机自启
-    {
-        WCHAR exePath[MAX_PATH];
-        if (GetModuleFileNameW(NULL, exePath, MAX_PATH))
-        {
-            HKEY hKey;
-            LONG res = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE | KEY_QUERY_VALUE, &hKey);
-            if (res == ERROR_SUCCESS)
-            {
-                // 检查是否已设置
-                WCHAR val[MAX_PATH] = {0};
-                DWORD type = 0, size = sizeof(val);
-                res = RegQueryValueExW(hKey, L"CapsLockImeToggle", NULL, &type, (BYTE *)val, &size);
-                if (res == ERROR_SUCCESS && type == REG_SZ && lstrcmpiW(val, exePath) == 0)
-                {
-                    // 已设置，执行取消
-                    res = RegDeleteValueW(hKey, L"CapsLockImeToggle");
-                    if (res == ERROR_SUCCESS)
-                    {
-                        MessageBoxW(hwnd, L"已取消开机自启！", L"提示", MB_OK | MB_ICONINFORMATION);
-                    }
-                    else
-                    {
-                        MessageBoxW(hwnd, L"取消开机自启失败，可能未设置或无权限！", L"错误", MB_OK | MB_ICONERROR);
-                    }
-                }
-                else
-                {
-                    // 未设置，执行设置
-                    res = RegSetValueExW(hKey, L"CapsLockImeToggle", 0, REG_SZ, (BYTE *)exePath, (lstrlenW(exePath) + 1) * sizeof(WCHAR));
-                    if (res == ERROR_SUCCESS)
-                    {
-                        MessageBoxW(hwnd, L"已设置为开机自启！", L"提示", MB_OK | MB_ICONINFORMATION);
-                    }
-                    else
-                    {
-                        MessageBoxW(hwnd, L"设置开机自启失败！", L"错误", MB_OK | MB_ICONERROR);
-                    }
-                }
-                RegCloseKey(hKey);
-            }
-            else
-            {
-                MessageBoxW(hwnd, L"无法访问注册表，操作失败！", L"错误", MB_OK | MB_ICONERROR);
-            }
-        }
-        else
-        {
-            MessageBoxW(hwnd, L"获取程序路径失败！", L"错误", MB_OK | MB_ICONERROR);
-        }
+    case 200: // 切换开机自启（任务计划程序方式）
+        ToggleAutoStart(hwnd);
         break;
-    }
     case 300: // 打开Windows 10/11输入法设置
     {
         HINSTANCE hRet = ShellExecuteW(NULL, L"open", L"ms-settings:regionlanguage", NULL, NULL, SW_SHOWNORMAL);
@@ -171,8 +291,11 @@ void ShowTrayMenu(HWND hwnd)
                             CloseHandle(g_hMutex); // 先释放互斥体
                             g_hMutex = NULL;
                         }
-                        ShellExecuteW(NULL, L"runas", exePath, NULL, NULL, SW_SHOWNORMAL);
-                        PostMessage(hwnd, WM_CLOSE, 0, 0); // 关闭当前进程
+                        HINSTANCE restartResult = ShellExecuteW(NULL, L"runas", exePath, NULL, NULL, SW_SHOWNORMAL);
+                        if ((INT_PTR)restartResult > 32)
+                            PostMessage(hwnd, WM_CLOSE, 0, 0); // 关闭当前进程
+                        else
+                            MessageBoxW(hwnd, L"管理员模式重启失败，当前程序仍在运行。", L"错误", MB_OK | MB_ICONERROR);
                     }
                     else
                     {
@@ -191,8 +314,11 @@ void ShowTrayMenu(HWND hwnd)
                 CloseHandle(g_hMutex); // 先释放互斥体
                 g_hMutex = NULL;
             }
-            ShellExecuteW(NULL, L"runas", exePath, NULL, NULL, SW_SHOWNORMAL);
-            PostMessage(hwnd, WM_CLOSE, 0, 0); // 关闭当前进程
+            HINSTANCE restartResult = ShellExecuteW(NULL, L"runas", exePath, NULL, NULL, SW_SHOWNORMAL);
+            if ((INT_PTR)restartResult > 32)
+                PostMessage(hwnd, WM_CLOSE, 0, 0); // 关闭当前进程
+            else
+                MessageBoxW(hwnd, L"管理员模式重启失败，当前程序仍在运行。", L"错误", MB_OK | MB_ICONERROR);
         }
         else
         {
@@ -213,10 +339,8 @@ void ToggleImeConversion(HWND hwnd)
     HKL hKL = GetKeyboardLayout(threadId);
     // 微软拼音输入法的HKL前缀通常为0xE00xxxxxx
     // 0x0804E00x: 微软拼音，0x0804xxxx: 其他中文输入法
-    WCHAR imeName[32] = {0};
-    GetKeyboardLayoutNameW(imeName);
-    // 判断是否为微软拼音（或兼容IME）
-    if ((UINT_PTR)hKL == 0xE00E0804 || wcsstr(imeName, L"E00") == imeName)
+    // 根据目标窗口线程的键盘布局判断微软拼音或兼容输入法
+    if ((UINT_PTR)hKL == 0xE00E0804 || ((UINT_PTR)hKL & 0xF0000000) == 0xE0000000)
     {
         HIMC hIMC = ImmGetContext(hwnd);
         if (hIMC)
@@ -261,12 +385,21 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
     if (nCode == HC_ACTION)
     {
         KBDLLHOOKSTRUCT *p = (KBDLLHOOKSTRUCT *)lParam;
+        if ((wParam == WM_KEYUP || wParam == WM_SYSKEYUP) && p->vkCode == VK_CAPITAL)
+        {
+            g_capsLockDown = FALSE;
+            return CallNextHookEx(g_hHook, nCode, wParam, lParam);
+        }
         if (wParam == WM_KEYDOWN && p->vkCode == VK_CAPITAL)
         {
+            if (g_capsLockDown)
+                return 1;
+
             // 菜单触发时允许本次CapsLock事件通过
             if (g_allowNextCaps)
             {
                 g_allowNextCaps = FALSE;
+                g_capsLockDown = TRUE;
                 return CallNextHookEx(g_hHook, nCode, wParam, lParam);
             }
             // 检查是否有修饰键（Ctrl/Shift/Alt/Win）按下，只有无修饰键时才拦截
@@ -276,13 +409,15 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
             SHORT win = GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN);
             if (!(ctrl & 0x8000) && !(shift & 0x8000) && !(alt & 0x8000) && !(win & 0x8000))
             {
-                HWND hwnd = GetForegroundWindow();
-                if (hwnd)
+                HWND targetWindow = GetForegroundWindow();
+                if (targetWindow && g_hMainWnd &&
+                    PostMessageW(g_hMainWnd, WM_TOGGLE_IME, (WPARAM)targetWindow, 0))
                 {
-                    ToggleImeConversion(hwnd);
+                    g_capsLockDown = TRUE;
+                    return 1;
                 }
                 // 不传递CapsLock按键，防止系统CapsLock状态改变
-                return 1;
+                return CallNextHookEx(g_hHook, nCode, wParam, lParam);
             }
             // 有修饰键时不拦截，允许系统处理
         }
@@ -305,6 +440,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             MessageBoxW(hwnd, L"CapsLock IME Toggle 正在运行\n右键托盘图标可退出", L"提示", MB_OK | MB_ICONINFORMATION);
         }
         break;
+    case WM_TOGGLE_IME:
+        if (IsWindow((HWND)wParam))
+            ToggleImeConversion((HWND)wParam);
+        break;
     case WM_DESTROY:
         RemoveTrayIcon();
         if (g_hHook)
@@ -323,7 +462,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     SetProcessDPIAware();
     // 创建互斥体，防止多开
     g_hMutex = CreateMutexW(NULL, FALSE, MUTEX_NAME);
-    if (g_hMutex == NULL || GetLastError() == ERROR_ALREADY_EXISTS)
+    if (g_hMutex == NULL)
+    {
+        MessageBoxW(NULL, L"创建程序互斥体失败，程序无法启动。", L"错误", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
         MessageBoxW(NULL, L"CapsLock IME Toggle 已经在运行！", L"提示", MB_OK | MB_ICONINFORMATION);
         if (g_hMutex)
@@ -359,6 +503,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
             CloseHandle(g_hMutex);
         return 1;
     }
+    g_hMainWnd = hwnd;
 
     // 添加托盘图标
     AddTrayIcon(hwnd);

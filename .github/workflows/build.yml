@@ -13,7 +13,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build with make
         run: |
@@ -21,13 +21,13 @@ jobs:
           make
 
       - name: Upload EXE artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: capslock_ime_toggle
           path: capslock_ime_toggle.exe
 
       - name: Create or Update Release v0.0.0
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v0.0.0
           name: v0.0.0
