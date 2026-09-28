@@ -9,9 +9,10 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "imm32.lib")
 
-#define MUTEX_NAME L"Global\\CapsLockImeToggleMutex" // 全局互斥体名，防止多开
+#define MUTEX_NAME L"Local\\CapsLockImeToggleMutex"  // 当前会话互斥体名，防止多开
 #define WM_TRAYICON (WM_USER + 1)                    // 托盘消息ID
 #define WM_TOGGLE_IME (WM_USER + 2)                  // 异步切换输入法消息
+#define TRAY_RETRY_TIMER 1                            // 托盘图标重试定时器
 #define TASK_NAME L"CapsLockImeToggle"              // 计划任务名称
 #define SCHTASKS_EXECUTION_FAILED ((DWORD)-1)
 
@@ -27,6 +28,8 @@ HHOOK g_hHook = NULL;              // 全局低级键盘钩子句柄，用于拦
 NOTIFYICONDATAW nid;               // 系统托盘图标数据结构
 HANDLE g_hMutex = NULL;            // 全局互斥体句柄，防止程序多开
 HWND g_hMainWnd = NULL;             // 隐藏窗口句柄，用于异步切换输入法
+UINT g_taskbarCreatedMessage = 0;   // Explorer 重建任务栏时发送的消息
+BOOL g_trayIconAdded = FALSE;       // 托盘图标是否已成功添加
 
 typedef enum
 {
@@ -208,8 +211,11 @@ void ToggleAutoStart(HWND hwnd)
 }
 
 // 添加系统托盘图标
-void AddTrayIcon(HWND hwnd)
+BOOL AddTrayIcon(HWND hwnd)
 {
+    if (g_trayIconAdded)
+        return TRUE;
+
     ZeroMemory(&nid, sizeof(nid));
     nid.cbSize = sizeof(nid);
     nid.hWnd = hwnd;
@@ -227,14 +233,20 @@ void AddTrayIcon(HWND hwnd)
     }
     if (!Shell_NotifyIconW(NIM_ADD, &nid))
     {
-        MessageBoxW(hwnd, L"添加托盘图标失败！", L"错误", MB_OK | MB_ICONERROR);
+        return FALSE;
     }
+    g_trayIconAdded = TRUE;
+    return TRUE;
 }
 
 // 移除系统托盘图标
 void RemoveTrayIcon()
 {
-    Shell_NotifyIconW(NIM_DELETE, &nid);
+    if (g_trayIconAdded)
+    {
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        g_trayIconAdded = FALSE;
+    }
 }
 
 // 显示托盘右键菜单
@@ -428,6 +440,15 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
 // 主窗口过程，处理托盘消息和退出
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (msg == g_taskbarCreatedMessage)
+    {
+        if (!AddTrayIcon(hwnd))
+            SetTimer(hwnd, TRAY_RETRY_TIMER, 2000, NULL);
+        else
+            KillTimer(hwnd, TRAY_RETRY_TIMER);
+        return 0;
+    }
+
     switch (msg)
     {
     case WM_TRAYICON:
@@ -443,6 +464,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_TOGGLE_IME:
         if (IsWindow((HWND)wParam))
             ToggleImeConversion((HWND)wParam);
+        break;
+    case WM_TIMER:
+        if (wParam == TRAY_RETRY_TIMER)
+        {
+            if (AddTrayIcon(hwnd))
+                KillTimer(hwnd, TRAY_RETRY_TIMER);
+        }
         break;
     case WM_DESTROY:
         RemoveTrayIcon();
@@ -490,6 +518,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     }
 
     // 创建隐藏窗口（不显示在任务栏，仅用于托盘消息）
+    g_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
     HWND hwnd = CreateWindowW(
         L"CapsLockImeToggleClass",
         L"CapsLock IME Toggle",
@@ -505,8 +534,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     }
     g_hMainWnd = hwnd;
 
-    // 添加托盘图标
-    AddTrayIcon(hwnd);
+    // 添加托盘图标，登录初期 Explorer 尚未就绪时自动重试
+    if (!AddTrayIcon(hwnd))
+        SetTimer(hwnd, TRAY_RETRY_TIMER, 2000, NULL);
 
     // 设置全局低级键盘钩子
     g_hHook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, hInstance, 0);
