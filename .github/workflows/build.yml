@@ -26,13 +26,22 @@ jobs:
           name: capslock_ime_toggle
           path: capslock_ime_toggle.exe
 
-      - name: Create or Update Release v0.0.0
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: v0.0.0
-          name: v0.0.0
-          files: capslock_ime_toggle.exe
-          prerelease: false
-          draft: false
+      - name: Snapshot release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          FILES: capslock_ime_toggle.exe
+        run: |
+          gh release delete v0.0.0 --cleanup-tag --yes
+          gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/git/refs/tags/v0.0.0"
+          $releaseArgs = @(
+            $env:FILES
+            '--target'
+            $env:GITHUB_SHA
+            '--title'
+            'Snapshot release'
+            '--notes'
+            "Automated snapshot of main at $env:GITHUB_SHA."
+            '--prerelease'
+            '--latest=false'
+          )
+          gh release create v0.0.0 @releaseArgs
